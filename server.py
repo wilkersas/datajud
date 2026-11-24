@@ -23,6 +23,7 @@ from typing import Any, Optional
 import requests
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from tribunais import buscar_tribunais, get_search_url
 
 # Chave pública padrão divulgada na Wiki do Datajud/CNJ.
@@ -30,7 +31,9 @@ from tribunais import buscar_tribunais, get_search_url
 # CNJ pode alterá-la a qualquer momento por razões de segurança.
 DEFAULT_API_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
 
-TIMEOUT_SEGUNDOS = int(os.environ.get("DATAJUD_TIMEOUT", "90"))
+TIMEOUT_SEGUNDOS = int(os.environ.get("DATAJUD_TIMEOUT", "60"))
+# Prazo total (todas as tentativas somadas) para não travar o chat.
+PRAZO_TOTAL_SEGUNDOS = int(os.environ.get("DATAJUD_PRAZO_TOTAL", "120"))
 # A API do Datajud frequentemente fica sobrecarregada e devolve 429
 # (es_rejected_execution_exception) ou 5xx; tentamos novamente com backoff.
 MAX_TENTATIVAS = int(os.environ.get("DATAJUD_MAX_TENTATIVAS", "4"))
@@ -65,49 +68,67 @@ def _headers() -> dict:
 
 def _executar_busca(tribunal: str, corpo: dict) -> dict:
     """Executa uma requisição POST contra o endpoint _search do tribunal informado."""
-    url = get_search_url(tribunal)
+    try:
+        url = get_search_url(tribunal)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
     resposta = None
+    inicio = time.monotonic()
     for tentativa in range(1, MAX_TENTATIVAS + 1):
+        restante = PRAZO_TOTAL_SEGUNDOS - (time.monotonic() - inicio)
+        if restante < 5:
+            break
         try:
             resposta = requests.post(
-                url, headers=_headers(), data=json.dumps(corpo), timeout=TIMEOUT_SEGUNDOS
+                url,
+                headers=_headers(),
+                data=json.dumps(corpo),
+                timeout=min(TIMEOUT_SEGUNDOS, restante),
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            if tentativa == MAX_TENTATIVAS:
-                raise RuntimeError(
-                    f"Falha de conexão com a API do Datajud após {MAX_TENTATIVAS} tentativas: {exc}"
+            if tentativa == MAX_TENTATIVAS or time.monotonic() - inicio > PRAZO_TOTAL_SEGUNDOS - 10:
+                raise ToolError(
+                    f"A API do Datajud não respondeu a tempo ({tentativa} tentativa(s), "
+                    f"{int(time.monotonic() - inicio)} s). O servidor do CNJ costuma ficar "
+                    "sobrecarregado; tente novamente em alguns minutos ou use filtros "
+                    f"mais específicos. Detalhe: {exc}"
                 ) from exc
             time.sleep(2 ** tentativa)
             continue
         except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Falha de conexão com a API do Datajud: {exc}") from exc
+            raise ToolError(f"Falha de conexão com a API do Datajud: {exc}") from exc
 
         if resposta.status_code in STATUS_RETENTAVEIS and tentativa < MAX_TENTATIVAS:
             time.sleep(2 ** tentativa)
             continue
         break
 
+    if resposta is None:
+        raise ToolError(
+            f"A API do Datajud não respondeu dentro de {PRAZO_TOTAL_SEGUNDOS} s "
+            "(sobrecarga do CNJ). Tente novamente em alguns minutos."
+        )
     if resposta.status_code == 401:
-        raise RuntimeError(
+        raise ToolError(
             "Autenticação recusada (401). A API Key pode estar desatualizada - "
             "o CNJ pode alterá-la a qualquer momento. Verifique a chave atual em "
             "https://datajud-wiki.cnj.jus.br/api-publica/ e configure a variável "
             "de ambiente DATAJUD_API_KEY."
         )
     if resposta.status_code == 429:
-        raise RuntimeError(
-            f"A API do Datajud recusou a busca (429) após {MAX_TENTATIVAS} tentativas - "
+        raise ToolError(
+            f"A API do Datajud recusou a busca (429) após {tentativa} tentativa(s) - "
             "normalmente é sobrecarga no Elasticsearch do CNJ. Tente novamente em instantes."
         )
     if not resposta.ok:
-        raise RuntimeError(
+        raise ToolError(
             f"Erro HTTP {resposta.status_code} do Datajud: {resposta.text[:1000]}"
         )
 
     try:
         return resposta.json()
     except ValueError as exc:
-        raise RuntimeError(f"Resposta inesperada (não-JSON) do Datajud: {resposta.text[:500]}") from exc
+        raise ToolError(f"Resposta inesperada (não-JSON) do Datajud: {resposta.text[:500]}") from exc
 
 
 def _formatar_hits(resultado: dict) -> dict:
@@ -244,7 +265,7 @@ def buscar_processos(
         )
 
     if not must:
-        raise ValueError(
+        raise ToolError(
             "Informe ao menos um filtro (classe_codigo, orgao_julgador_nome, "
             "assunto_codigo, datas ou texto_livre) além do tribunal."
         )
@@ -281,10 +302,10 @@ def consulta_avancada(tribunal: str, query_json: str, tamanho: Optional[int] = N
     try:
         corpo = json.loads(query_json)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"query_json inválido - não é um JSON válido: {exc}") from exc
+        raise ToolError(f"query_json inválido - não é um JSON válido: {exc}") from exc
 
     if not isinstance(corpo, dict):
-        raise ValueError("query_json deve representar um objeto JSON (dict).")
+        raise ToolError("query_json deve representar um objeto JSON (dict).")
 
     if tamanho is not None:
         corpo["size"] = max(1, min(tamanho, 100))
